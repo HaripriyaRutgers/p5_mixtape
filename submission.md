@@ -355,3 +355,6 @@ return metadata without calling `get_playlist_songs()`. Full suite: 13 passed.
 
 ---
 
+<img width="914" height="138" alt="Screenshot 2026-07-06 at 12 08 27 AM" src="https://github.com/user-attachments/assets/7e529445-3180-4444-ad66-f41a11125dc7" />
+
+
