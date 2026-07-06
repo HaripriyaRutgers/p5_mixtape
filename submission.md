@@ -2,13 +2,74 @@
 
 Mixtape is a small Flask + SQLAlchemy social music app where friends share songs,
 rate them, build collaborative playlists, and keep listening streaks. This document
-has two parts:
+has three parts:
 
 1. **Codebase Map** — how the app is put together and how data flows through it.
 2. **Bug Fix Write-Ups** — the three bugs I fixed (Issues #1, #4, #5), plus one
    issue I investigated and found was not actually a bug (#3).
+3. **AI Usage** (below, first) — an honest account of how I used an AI assistant.
 
 After all three fixes, the full test suite is green: **13 passed**.
+
+---
+
+## AI Usage
+
+I used an AI coding assistant (Claude Code, running in my IDE) throughout this
+project — mostly as a guide for navigating an unfamiliar codebase and as a pair for
+reproducing and fixing the bugs. Being specific about the collaboration:
+
+**What I asked it to explain, trace, or summarize.**
+
+- Explain [`models.py`](models.py) — the entities and their relationships — so I
+  understood the data model before reading any logic.
+- Summarize what the [`services/`](services/) and [`routes/`](routes/) directories
+  do. This gave me the routes → services → models mental model I then used to hunt
+  every bug.
+- Trace Issue #1 from symptom to root cause: I asked it to follow the call chain
+  from the `/listen` endpoint into the service. It walked me
+  `routes/songs.py` → `record_listening_event()` → `update_listening_streak()` and
+  pointed at the weekday clause.
+- For the boundary bugs (#1, #5), I asked it to reason through "what state does the
+  app need to be in to hit this code path" *before* I trusted any fix.
+- I also had it draft the one-line fixes and the first draft of this write-up, which
+  I then reviewed and checked against the passing test suite.
+
+**What it helped me understand.**
+
+- The strict three-layer architecture, which made the codebase predictable — once I
+  saw that routes never hold logic, I stopped reading routes closely and jumped
+  straight to the services, which is where all the real bugs live.
+- A SQLAlchemy detail I didn't know: the legacy `db.session.query(Model).all()` API
+  de-duplicates entity rows by primary key. That single fact is what explained the
+  Issue #3 result.
+
+**Where I had to verify things myself, or the AI was incomplete or wrong.**
+
+- **Issue #3 was the biggest one.** When the assistant first summarized the services,
+  it confidently listed the search `outerjoin` as a likely duplicate bug ("a song
+  with N tags appears N times"). That's true of the raw SQL but *wrong about the
+  observable behavior*. I only caught it by running `pytest tests/test_search.py`
+  (all passing) and a direct probe: `search_songs("Crown Heights")` returned 1 row
+  while the raw join returned 3. So the AI's first explanation pointed me in the
+  wrong direction until the ORM de-duplication was accounted for — running the code
+  is what corrected it.
+- When explaining `models.py`, it flagged friendships as "not truly symmetric," but
+  [`seed_data.py`](seed_data.py) inserts both directions manually, so with the real
+  data it works fine — the AI's first pass overstated that as a defect.
+- For the data-flow diagram, the project prompt suggested "sharing a song triggers a
+  notification." I had the AI check, and sharing does **not** emit a notification in
+  this code (only rating and playlist-adds do), so I documented a real flow instead
+  of one that doesn't exist.
+- **The UTC streak sub-issue:** the AI reasoned it through, but neither of us could
+  reproduce it at runtime, because the `User` model stores no timezone. I confirmed
+  it by reading the code rather than trusting the explanation, and deliberately left
+  it unfixed (a proper fix needs a schema change).
+
+**Overall.** The AI was strongest at fast navigation and explaining framework
+behavior, and weakest when it reasoned from the code *without running it* — every
+"this is a bug" claim only became trustworthy after I reproduced it with a test or a
+script. I treated its explanations as leads to verify, not as conclusions.
 
 ---
 
