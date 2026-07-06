@@ -1,205 +1,312 @@
-models.py:
+# Project 5 — Mixtape Bug Hunt: Submission
 
+Mixtape is a small Flask + SQLAlchemy social music app where friends share songs,
+rate them, build collaborative playlists, and keep listening streaks. This document
+has two parts:
 
-Model	Represents	Key fields
-User	An account	username, email, listening_streak, last_listened_at
-Song	A shared track	title, artist, album, genre, shared_by (→ User), share_note
-Tag	A label for songs	name (unique)
-ListeningEvent	A play/listen log	user_id, song_id, listened_at
-Rating	A user's score of a song	score (1–5), unique per (user, song)
-Playlist	A song collection	name, created_by, is_collaborative
-Notification	An in-app message	notification_type, body, read flag
+1. **Codebase Map** — how the app is put together and how data flows through it.
+2. **Bug Fix Write-Ups** — the three bugs I fixed (Issues #1, #4, #5), plus one
+   issue I investigated and found was not actually a bug (#3).
 
+After all three fixes, the full test suite is green: **13 passed**.
 
-Services directory:
- 
-File	Responsibility
-feed_service.py	Builds social feeds — "Friends Listening Now" (friends active in last 24h, deduped to one song each) and a general activity feed of recent friend listens.
-notification_service.py	Creates/reads notifications, plus the interactions that trigger them: adding a song to a playlist and rating a song (1–5, upsert per user/song).
-playlist_service.py	Playlist CRUD — create, fetch metadata, fetch a user's playlists, and get a playlist's songs in position order.
-search_service.py	Song search by title/artist (case-insensitive ILIKE) and single-song lookup.
-streak_service.py	Records listening events and maintains the consecutive-day listening streak on the user.
+---
 
+## 1. Codebase Map
 
-/routes:
-The routes/ directory is the HTTP layer — it defines the app's REST API endpoints. Each file is a Flask Blueprint that maps URLs to handler functions, which parse the request, delegate to a service, and return JSON.
+### 1.1 Main files and what each does
 
-It's a clean three-layer split: routes (HTTP) → services (business logic) → models (database). Routes contain no business logic — they just validate input, call a service, and translate the result (or a ValueError) into a JSON response with the right status code.
+| File | Layer | Responsibility |
+|------|-------|----------------|
+| [`app.py`](app.py) | App setup | Flask application factory (`create_app`). Configures the SQLite DB, registers the four blueprints under their URL prefixes (`/songs`, `/playlists`, `/users`, `/feed`), and creates tables. |
+| [`models.py`](models.py) | Data | All SQLAlchemy models and association tables. Every entity uses a string UUID primary key and UTC timestamps. |
+| [`seed_data.py`](seed_data.py) | Data | Populates the DB with realistic test data — 5 users with friendships, 25 songs with varying tag counts, 3 playlists, listening events, streaks, and a sample notification. |
+| [`routes/songs.py`](routes/songs.py) | HTTP | Song search, detail, rating, and listen endpoints. |
+| [`routes/playlists.py`](routes/playlists.py) | HTTP | Playlist create, detail, list-songs, and add-song endpoints. |
+| [`routes/users.py`](routes/users.py) | HTTP | User profile, streak, and notification endpoints. |
+| [`routes/feed.py`](routes/feed.py) | HTTP | "Friends listening now" and activity feed endpoints. |
+| [`services/streak_service.py`](services/streak_service.py) | Logic | Records listening events and maintains the consecutive-day listening streak. |
+| [`services/notification_service.py`](services/notification_service.py) | Logic | Creates/reads notifications and the actions that trigger them (adding a song to a playlist, rating a song). |
+| [`services/feed_service.py`](services/feed_service.py) | Logic | Builds the "friends listening now" (last 24h, one song per friend) and general activity feeds. |
+| [`services/playlist_service.py`](services/playlist_service.py) | Logic | Playlist creation and retrieval, including songs in `position` order. |
+| [`services/search_service.py`](services/search_service.py) | Logic | Song search by title/artist (case-insensitive) and single-song lookup. |
+| [`tests/`](tests/) | Tests | `test_streaks.py`, `test_search.py`, `test_playlists.py` — pytest suites against an in-memory SQLite DB. |
 
-The four blueprints
-File	Blueprint	Endpoints
-users.py	users_bp	GET /<id>, GET /<id>/streak, GET /<id>/notifications, POST /notifications/<id>/read
-feed.py	feed_bp	GET /<id>/listening-now, GET /<id>/activity
-songs.py	songs_bp	GET /search, GET /<id>, POST /<id>/rate, POST /<id>/listen
-playlists.py	playlists_bp	POST /, GET /<id>, GET /<id>/songs, POST /<id>/songs
+### 1.2 The data model
 
+The core entities in [`models.py`](models.py):
 
-===========================================================
-BUG WRITE-UPS
-===========================================================
-Each issue is traced route -> service -> function, with the exact
-state/data condition needed to hit the code path, how I reproduced it,
-and the fix. Repro evidence is from `pytest tests/` and small scripts
-run against a fresh in-memory DB (same shape as seed_data.py).
+| Model | Represents | Key fields |
+|-------|-----------|-----------|
+| `User` | An account | `username`, `email`, `listening_streak`, `last_listened_at` |
+| `Song` | A shared track | `title`, `artist`, `album`, `genre`, `shared_by` (→ `User`), `share_note` |
+| `Tag` | A label for songs | `name` (unique) |
+| `ListeningEvent` | A play/listen log | `user_id`, `song_id`, `listened_at` |
+| `Rating` | A user's score of a song | `score` (1–5), unique per (user, song) |
+| `Playlist` | A song collection | `name`, `created_by`, `is_collaborative` |
+| `Notification` | An in-app message | `notification_type`, `body`, `read` |
 
+Relationships are wired through association tables: `friendships` (self-referential
+many-to-many on `User`), `song_tags` (`Song` ↔ `Tag`), and `playlist_entries`
+(`Playlist` ↔ `Song`, carrying `position`, `added_by`, and `added_at`).
 
------------------------------------------------------------
-ISSUE #1 — "My listening streak keeps resetting" (streak_service.py)
------------------------------------------------------------
-Call chain (shared by both sub-bugs below):
-  POST /songs/<song_id>/listen   (routes/songs.py:43)
-    -> record_listening_event(user_id, song_id)   (streak_service.py:14)
-       -> update_listening_streak(user, now)      (streak_service.py:42)
-Precondition for either bug: user.last_listened_at is NOT None. A first-ever
-listen short-circuits at line 58 (streak = 1) and never reaches the buggy code.
+### 1.3 Data flow example: rating a song triggers a notification
 
---- 1a. Bogus Sunday rule (streak_service.py:73) ---
-Code:
-    elif days_since_last == 1 and today.weekday() != 6:   # 6 == Sunday
-        user.listening_streak += 1
-    else:
-        user.listening_streak = 1
-Root cause: the extra `and today.weekday() != 6` clause has nothing to do with
-the documented rules. When today is a Sunday the increment branch is skipped
-and control falls to `else`, resetting a valid streak to 1.
+This traces one full feature from HTTP request to database side effect:
 
-State needed to hit it:
-  - listening_streak already > 0 (an existing streak to lose),
-  - last_listened_at is exactly one calendar day before now (days_since_last == 1),
-  - now falls on a Sunday (today.weekday() == 6).
-It is invisible 6 days out of 7 — only a Saturday->Sunday consecutive listen
-triggers it, which is why the report says "keeps resetting" without an obvious cause.
+```
+POST /songs/<song_id>/rate   { "user_id": B, "score": 5 }
+        │
+        ▼
+routes/songs.py  ·  rate()                      # parse JSON, validate presence of args
+        │  calls
+        ▼
+notification_service.rate_song(B, song_id, 5)   # business logic
+        ├─ validate score is 1–5
+        ├─ load Song and rater (User)
+        ├─ upsert the Rating row  ──► db.session.commit()      # (1) rating saved
+        └─ if song.shared_by != B:
+               create_notification(...)                        # (2) notify the sharer
+                    └─ Notification row  ──► db.session.commit()
+        │  returns Rating
+        ▼
+routes/songs.py returns  201  { rating.to_dict() }
+```
 
-How I reproduced it:
-  `pytest tests/test_streaks.py::test_streak_increments_on_sunday` -> FAILED.
-  Sequence inside the test:
-    update_listening_streak(u, Sat 2024-06-15 12:00 UTC)  -> streak == 1  (ok)
-    update_listening_streak(u, Sun 2024-06-16 12:00 UTC)  -> streak == 1
-  Observed: `assert 1 == 2` fails. Expected 2 (consecutive day), got 1 (reset).
+The song's original sharer (`song.shared_by`) later reads that notification via
+`GET /users/<id>/notifications` → `notification_service.get_notifications()`. The
+"add a song to a playlist" feature follows the identical shape: the route calls
+`add_to_playlist()`, which mutates data and then calls `create_notification()` for
+the sharer using the same `song.shared_by != actor` guard.
 
-Fix: delete the weekday clause.
-    elif days_since_last == 1:
-        user.listening_streak += 1
+The listening-streak feature is the same pattern too:
+`POST /songs/<id>/listen` → `streak_service.record_listening_event()` →
+`update_listening_streak()`, which writes the streak back onto the `User` row.
 
---- 1b. Day boundaries computed in UTC (streak_service.py:56) ---
-Code:
-    today = now.date()            # now = datetime.now(timezone.utc)
-    last_date = last_listened.date()
-    days_since_last = (today - last_date).days
-Root cause: "which day is it" is decided at UTC midnight, not the user's local
-midnight, so evening / early-morning listens land in the wrong calendar day.
+### 1.4 Patterns I noticed
 
-State needed to expose it: a user in a non-UTC timezone listening near their
-local midnight, so the UTC date and their local date disagree. Example (UTC-5):
-  - local Mon 9:00 PM = Tue 02:00 UTC  and  local Tue 8:00 PM = Wed 01:00 UTC
-    -> seen as Tue and Wed = consecutive (accidentally fine), but
-  - local Mon 9:00 PM (Tue 02:00 UTC) then local Tue 7:00 AM (Tue 12:00 UTC)
-    -> both map to Tue UTC, days_since_last == 0, so a genuine new-day listen
-       is treated as "already listened today" and the streak never advances.
+- **Strict three-layer split: routes → services → models.** Routes never contain
+  business logic — they parse the request, call exactly one service function, and
+  translate the result (or a `ValueError`) into JSON. All real logic lives in
+  `services/`, and all persistence lives in `models.py`. This is why every bug in
+  this project lives in the service layer, and why the fastest way to find one is
+  to trace from the route into the service it calls.
+- **Consistent error handling.** Services raise `ValueError` for "not found" or bad
+  input; routes wrap the call in `try/except ValueError` and return `404`/`400`.
+- **`to_dict()` on every model.** Serialization lives on the model, so services and
+  routes pass plain dicts around and never leak ORM objects into responses.
+- **UUID primary keys + UTC timestamps everywhere**, generated by defaults on the
+  models (`generate_uuid`, `datetime.now(timezone.utc)`).
+- **Notifications are a shared side effect.** Multiple actions (playlist-add, rating)
+  converge on the same `create_notification()` helper with the same
+  "don't notify yourself" guard — a reusable pattern rather than one-off code.
 
-How I reproduced it: NOT reproduced at runtime — the User model stores no
-timezone and the /listen endpoint uses the real clock, so I can't drive a
-specific local-vs-UTC boundary through the API. Confirmed by reading the code:
-`now.date()` on a UTC datetime is a UTC calendar date. This is a latent
-correctness issue rather than one the current tests exercise.
+---
 
-Fix: needs a user timezone to be correct. (a) add a `timezone` field to User,
-(b) convert `now` and `last_listened_at` into that zone before `.date()`.
-Without a stored tz there is no correct local date to compute, so the honest
-minimum is to document the UTC assumption; the real fix requires the tz field.
+## 2. Bug Fix Write-Ups
 
+I fixed **Issues #1, #4, and #5**. Each write-up below has the five required fields.
+Reproduction evidence comes from `pytest tests/` and short scripts run against a
+fresh in-memory DB (same data shape as [`seed_data.py`](seed_data.py)).
 
------------------------------------------------------------
-ISSUE #3 — "The same song shows up twice in search" (search_service.py)
------------------------------------------------------------
-Call chain:
-  GET /songs/search?q=...   (routes/songs.py:11)
-    -> search_songs(query)  (search_service.py:11)
-Suspect code:
-    db.session.query(Song)
-      .outerjoin(song_tags, Song.id == song_tags.c.song_id)
-      .filter(or_(Song.title.ilike(...), Song.artist.ilike(...)))
-      .all()
-Theory of the bug: the outerjoin to song_tags produces one SQL row per
-(song, tag) pair, so a song with 3 tags should come back 3 times — and only
-tagged songs would duplicate, matching the "inconsistent" wording.
+### Issue #1 — "My listening streak keeps resetting"
 
-State I set up to hit it: a song ("Crown Heights Anthem" / "Borough Kings")
-with 3 tags, alongside 0-tag and 1-tag songs, then searched a term matching
-the multi-tag song's title/artist.
+**How I reproduced it.** Before changing anything I ran the existing streak tests to
+watch the bug fail on its own: `pytest tests/test_streaks.py -v`. Four tests passed
+but `test_streak_increments_on_sunday` failed. It performs the reported action:
 
-How I reproduced it: ATTEMPTED, but the bug DID NOT manifest.
-  - `pytest tests/test_search.py` -> all pass, including
-    test_search_no_duplicates_multi_tag_song (asserts exactly 1 result).
-  - Direct probe on a fresh DB:
-        search_songs("Crown Heights")            -> 1 row
-        raw outerjoin SELECT (pre-ORM-uniquing)  -> 3 rows
-Explanation: the join really does emit 3 rows, but `db.session.query(Song).all()`
-uses SQLAlchemy's legacy Query API, which de-duplicates entity rows by primary-key
-identity. So the 3 rows collapse back to 1 Song object and the user never sees a
-duplicate. The outerjoin is effectively dead code (nothing filters or selects on
-it), but it is currently harmless.
+```
+update_listening_streak(u, Sat 2024-06-15 12:00 UTC)  → streak becomes 1
+update_listening_streak(u, Sun 2024-06-16 12:00 UTC)  → streak stays 1  (assert 1 == 2 fails)
+```
 
-Fix (cleanup / defensive, not a behavior change today): remove the pointless
-outerjoin, or make the de-dup explicit with `.distinct()`, so correctness no
-longer relies on the ORM's implicit uniquing (which does NOT apply if this is
-ever ported to 2.0-style `select()` without `.unique()`).
+Saturday-then-Sunday is a consecutive day, so it should reach 2. The trigger is very
+specific: an existing streak **+** a listen exactly one day after the last one **+**
+that day being a **Sunday**. The "only on Sundays" detail is why a user perceives it
+as random resetting.
 
+**How I found the root cause.** Starting from the README issue table (which pointed
+at `streak_service.py`) I traced route → service:
 
------------------------------------------------------------
-ISSUE #4 — "Notified when a song is added to a playlist, but not when
-            it is rated" (notification_service.py)
------------------------------------------------------------
-Call chains:
-  works:  POST /playlists/<id>/songs -> add_to_playlist() -> create_notification()
-  broken: POST /songs/<id>/rate      -> rate_song()       -> (no notification)
-Root cause: add_to_playlist (notification_service.py:65) notifies the song's
-sharer, but rate_song (notification_service.py:73) saves the Rating and returns
-— it never calls create_notification, so the sharer is never told.
+1. [`routes/songs.py:43`](routes/songs.py#L43) — `POST /songs/<song_id>/listen` does
+   no logic; it just calls `record_listening_event()`.
+2. [`streak_service.py:14`](services/streak_service.py#L14) — `record_listening_event()`
+   creates the `ListeningEvent`, then delegates to `update_listening_streak(user, now)`.
+3. [`streak_service.py:42`](services/streak_service.py#L42) — `update_listening_streak()`
+   is the end of the chain, where the date math lives.
 
-State needed to hit it: user A shares a song; a different user B rates it
-(score 1-5). Expected: A receives a "song_rated" notification. Actual: none.
-(If the rater IS the sharer, no notification is desired anyway — mirror the
-`song.shared_by != user_id` guard that add_to_playlist already uses.)
+The moment I was sure: line 73 read
+`elif days_since_last == 1 and today.weekday() != 6:`. The failing test used a Sunday,
+and `weekday() == 6` **is** Sunday — so that `and` clause was exactly what pushed a
+consecutive-day Sunday into the reset branch. That matched the "only Sundays" pattern
+precisely.
 
-How I reproduced it: script on a fresh DB —
-    A shares song S;  B calls rate_song(B, S, 5);  get_notifications(A)
-  Observed: A's notification count = 0 before AND 0 after the rating; types = [].
-  Contrast: calling add_to_playlist for the same song DOES create one. This
-  matches the seeded "song_added_to_playlist" notification that exists while no
-  "song_rated" notification type is ever produced.
+**The root cause.** The consecutive-day increment carried an extra, undocumented
+condition: `and today.weekday() != 6`. On any Sunday, even when the user listened the
+day before (`days_since_last == 1`, which should increment), the condition was `False`,
+so control fell into the `else` and reset the streak to 1. Nothing in the streak rules
+mentions weekdays — the clause simply should not exist.
 
-Fix: in rate_song, after the commit, notify the sharer (guarding self-ratings):
-    if song.shared_by != user_id:
-        create_notification(
-            user_id=song.shared_by,
-            notification_type="song_rated",
-            body=f"{rater.username} rated your song '{song.title}' {score}/5.",
-        )
+**My fix and side-effect check.** One-line change in
+[`streak_service.py:73`](services/streak_service.py#L73):
 
+```python
+elif days_since_last == 1:          # was: ... and today.weekday() != 6
+    user.listening_streak += 1
+```
 
------------------------------------------------------------
-ISSUE #5 — "The last song in a playlist never shows up" (playlist_service.py)
------------------------------------------------------------
-Call chain:
-  GET /playlists/<id>/songs   (routes/playlists.py:34)
-    -> get_playlist_songs(playlist_id)   (playlist_service.py:38)
-Root cause (playlist_service.py:66):
-    return [song.to_dict() for song in songs[:-1]]
-The `[:-1]` slice drops the last element. Since songs are ordered ascending by
-position, the highest-position (most recently added) song is always omitted,
-even though the docstring promises "all songs in the playlist."
+This is a boundary-condition bug, so I verified both sides of the `days_since_last`
+boundary — all existing tests pass now:
 
-State needed to hit it: any playlist with >= 1 song. With N songs the endpoint
-returns N-1; a 1-song playlist returns an empty list. (An already-empty playlist
-returns [] either way, so it looks fine — masking the bug for empty playlists.)
+| Condition | Expected | Test |
+|-----------|----------|------|
+| `== 0` (same day) | no change | `test_streak_does_not_double_count_same_day` |
+| `== 1` (consecutive) | +1, on every weekday | `test_streak_increments_on_consecutive_day`, `_on_sunday` |
+| `> 1` (skipped a day) | reset to 1 | `test_streak_resets_after_skipped_day` |
+| first-ever listen | 1 | `test_streak_starts_at_1_for_new_user` |
 
-How I reproduced it: `pytest tests/test_playlists.py` -> 2 failures:
-  - test_playlist_returns_all_songs:   len(songs) == 4, expected 5.
-  - test_playlist_returns_songs_in_order: got ['Track 1'..'Track 4'],
-    expected ['Track 1'..'Track 5'] — "Track 5" (last position) is missing.
-  With seed_data, playlist "Late Night Vibes" holds 7 songs but the endpoint
-  returns 6, dropping the position-7 song ("Free Throws" by Hoop Dreams).
+The only other reader of this data, `get_streak()`
+([`streak_service.py:81`](services/streak_service.py#L81)), just returns the stored
+value and is unaffected. `weekday()` appears nowhere else, so no companion change was
+needed.
 
-Fix: iterate over the full list.
-    return [song.to_dict() for song in songs]
+> **Out of scope, left unfixed on purpose:** the same function computes "today" from a
+> UTC datetime (`now.date()`, line 56), so day boundaries are UTC midnight, not the
+> user's local midnight. Fixing that correctly requires a per-user timezone, which the
+> `User` model doesn't store — that's a schema change, not a targeted fix, so I flagged
+> it rather than restructure the model.
+
+### Issue #4 — "I got notified when a friend added my song to a playlist, but not when they rated it"
+
+**How I reproduced it.** There's no test for this, so I wrote a short script against a
+fresh in-memory DB to act out the report:
+
+- user A ("alice") shares song S
+- a different user B ("bob") calls `rate_song(B, S, 5)`
+- then `get_notifications(A)` to see if A was told
+
+Observed: A had **0** notifications before the rating and **still 0** after. As a
+control I ran the working half of the report — `add_to_playlist()` for the same song —
+and that **did** create a notification for A. So rating specifically produced nothing.
+
+**How I found the root cause.** Navigation path:
+
+1. README issue table → `notification_service.py`.
+2. [`routes/songs.py:29`](routes/songs.py#L29) — the rate action `POST /songs/<id>/rate`
+   calls `rate_song()`; the working playlist-add action
+   ([`routes/playlists.py:43`](routes/playlists.py#L43)) calls `add_to_playlist()`.
+   Both live in the same service file, so I could read the broken one next to the
+   working one.
+3. [`notification_service.py`](services/notification_service.py) — `add_to_playlist()`
+   (line 35) ends with a call to `create_notification()` to tell the sharer. But
+   `rate_song()` (line 73) validates the score, upserts the `Rating`, commits, and
+   returns — and never calls `create_notification()` at all.
+
+The moment I was sure: side by side, the working function had the
+`create_notification()` call and the broken one simply didn't. It wasn't a wrong
+condition — it was a **missing step**.
+
+**The root cause.** `rate_song()` never creates a notification. The rating path saves
+the `Rating` row and returns; no code produces a `"song_rated"` notification, so the
+person who shared the song is never told it was rated.
+
+**My fix and side-effect check.** Right after `rate_song()` commits the rating, I added
+a notification to the sharer, copying the exact pattern and self-action guard that
+`add_to_playlist()` already uses:
+
+```python
+if song.shared_by != user_id:
+    create_notification(
+        user_id=song.shared_by,
+        notification_type="song_rated",
+        body=f"{rater.username} rated your song '{song.title}' {score}/5.",
+    )
+```
+
+This adds the missing step. The `shared_by != user_id` guard means rating your own
+song doesn't notify you — consistent with the playlist path. Side-effect check: I
+re-ran my script — B rating A's song now creates exactly one `"song_rated"`
+notification, and A rating their own song creates none. I placed the call **after** the
+rating's `commit()` (and `create_notification()` runs its own commit), so the rating is
+saved regardless. `get_notifications()` and `mark_as_read()` only read/update rows and
+are unaffected; the full suite still passes (13 passed).
+
+> **Behavior choice:** re-rating an already-rated song fires another notification, which
+> matches "notify when rated." If notifying only on the first rating is preferred, it's
+> a one-line move into the new-rating branch.
+
+### Issue #5 — "The last song in a playlist never shows up"
+
+**How I reproduced it.** I ran `pytest tests/test_playlists.py -v`; two tests failed
+against a seeded 5-song playlist:
+
+```
+test_playlist_returns_all_songs       → got 4 songs, expected 5
+test_playlist_returns_songs_in_order  → got ['Track 1'..'Track 4'], expected ['Track 1'..'Track 5']
+```
+
+The trigger is simply any playlist with at least one song — the last song by position
+is missing every time. (With the seed data, playlist "Late Night Vibes" has 7 songs but
+the endpoint returns 6, dropping the position-7 song "Free Throws" by Hoop Dreams.)
+
+**How I found the root cause.** Navigation path:
+
+1. README issue table → `playlist_service.py`.
+2. [`routes/playlists.py:34`](routes/playlists.py#L34) — `GET /playlists/<id>/songs`
+   just calls `get_playlist_songs()` and wraps the result with a `count`.
+3. [`playlist_service.py:38`](services/playlist_service.py#L38) — `get_playlist_songs()`.
+   The query is correct: it joins `playlist_entries` and orders by `position` ascending,
+   so all rows come back in order. But the return statement at line 66 was:
+
+   ```python
+   return [song.to_dict() for song in songs[:-1]]
+   ```
+
+The moment I was sure: the `[:-1]` slice. The query returned every song, then the
+return line deliberately sliced off the last element — the exact spot the last song
+disappears, and why the "in order" test loses "Track 5" (the highest position).
+
+**The root cause.** The slice `songs[:-1]` drops the final element of the result list.
+Because songs are ordered ascending by `position`, the last element is the
+highest-position (most recently added) song, so it's always omitted — even though the
+function's docstring promises "all songs in the playlist." For N songs it returns N-1;
+for a 1-song playlist it returns an empty list.
+
+**My fix and side-effect check.** One-line change in
+[`playlist_service.py:66`](services/playlist_service.py#L66):
+
+```python
+return [song.to_dict() for song in songs]     # was: songs[:-1]
+```
+
+This is a boundary bug at the end of the list, so I verified both sides — all tests
+pass now:
+
+| Condition | Expected | Test |
+|-----------|----------|------|
+| non-empty playlist | returns ALL N songs, in order | `test_playlist_returns_all_songs`, `_in_order` |
+| empty playlist | returns `[]` | `test_empty_playlist_returns_empty_list` |
+
+The empty case matters: the old `[][:-1]` was also `[]`, so an empty playlist looked
+fine before and must still be fine after — it is. Other playlist code is unaffected:
+the route's `count` is now accurate, and `get_playlist()` / `get_user_playlists()`
+return metadata without calling `get_playlist_songs()`. Full suite: 13 passed.
+
+---
+
+## 3. Investigated but Not a Bug — Issue #3
+
+**Issue #3 — "The same song keeps showing up twice in search."** I investigated this
+and could **not** reproduce it, so I did not change any code. I set up a song with 3
+tags next to 0-tag and 1-tag songs and searched for it:
+
+- `pytest tests/test_search.py` passes, including `test_search_no_duplicates_multi_tag_song`.
+- A direct probe showed `search_songs("Crown Heights")` returns **1** row, while the
+  raw outer-join `SELECT` returns **3** rows.
+
+The reason: `search_songs()` uses the legacy `db.session.query(Song).all()` API, which
+de-duplicates entity rows by primary key, so the 3 join rows collapse back to a single
+`Song`. The `outerjoin` on `song_tags` is effectively dead code but currently harmless.
+If I wanted to harden it against a future port to 2.0-style `select()` I'd drop the
+join or add `.distinct()` — but that's cleanup, not a behavior fix, so I left the code
+as-is and recorded the finding here.
