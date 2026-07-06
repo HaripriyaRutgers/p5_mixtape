@@ -355,19 +355,3 @@ return metadata without calling `get_playlist_songs()`. Full suite: 13 passed.
 
 ---
 
-## 3. Investigated but Not a Bug — Issue #3
-
-**Issue #3 — "The same song keeps showing up twice in search."** I investigated this
-and could **not** reproduce it, so I did not change any code. I set up a song with 3
-tags next to 0-tag and 1-tag songs and searched for it:
-
-- `pytest tests/test_search.py` passes, including `test_search_no_duplicates_multi_tag_song`.
-- A direct probe showed `search_songs("Crown Heights")` returns **1** row, while the
-  raw outer-join `SELECT` returns **3** rows.
-
-The reason: `search_songs()` uses the legacy `db.session.query(Song).all()` API, which
-de-duplicates entity rows by primary key, so the 3 join rows collapse back to a single
-`Song`. The `outerjoin` on `song_tags` is effectively dead code but currently harmless.
-If I wanted to harden it against a future port to 2.0-style `select()` I'd drop the
-join or add `.distinct()` — but that's cleanup, not a behavior fix, so I left the code
-as-is and recorded the finding here.
